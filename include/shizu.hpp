@@ -1,0 +1,38 @@
+#ifndef SHIZU_HPP
+#define SHIZU_HPP
+#include <cstdlib>
+#include <hardware/regs/m33.h>
+#include <kernel.hpp>
+#include <kernel_object.hpp>
+#include <svc.hpp>
+namespace shizu {
+[[noreturn]] __always_inline void set_current_context_as_kernel_init() {
+
+  void *entry_PSP = (void *)(((uint32_t)malloc(4096) + 4096) & ~0xF);
+  object_table[0].thread_table.insert(0);
+  object_table[0].state = object_t::state_t::KERNEL_OBJECT;
+  thread_table[0].context = new context_t();
+  thread_table[0].context->sp = (shizu::exception_frame_t *)entry_PSP;
+  thread_table[0].state = thread_t::state_t::RUNNING;
+  uintptr_t CONTROL_MASK = 1 << 1;
+  asm volatile("MSR PSP,%[entry_psp];"
+               "MSR CONTROL, %[CONTROL_MASK];"
+               "isb;"
+               :
+               : [entry_psp] "r"(entry_PSP), [CONTROL_MASK] "r"(CONTROL_MASK)
+               : "memory");
+  kernel_object_main();
+  while (1)
+  {
+  }
+  
+}
+[[noreturn]] __always_inline void init() {
+  cpu_manager::init();
+  object_table_init();
+  thread_table_init();
+  set_current_context_as_kernel_init();
+}
+
+} // namespace shizu
+#endif // SHIZU_HPP
