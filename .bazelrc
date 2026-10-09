@@ -1,0 +1,16 @@
+build --platforms=@pico-sdk//bazel/platform:rp2350
+build --@pico-sdk//bazel/config:PICO_BOARD=pico2_w
+build --@shizuku//configs:board=rp2350_pico2_w
+
+build --@pico-sdk//bazel/config:PICO_STDIO_USB=False
+build --@pico-sdk//bazel/config:PICO_TINYUSB_CONFIG=@shizuku//modules/pico_sdk_support:tusb_config
+build --@pico-sdk//bazel/config:PICO_CONFIG_EXTRA_HEADER=@shizuku//configs:pico_extra_config
+build --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=//:btstack_config
+build --@pico-sdk//bazel/config:PICO_BT_ENABLE_CLASSIC=True
+
+build --cxxopt=-std=c++23
+build --copt=-Og
+build --copt=-g3
+build --strip=never
+
+try-import %workspace%/.bazelrc.user

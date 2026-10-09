@@ -1,0 +1,44 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_library(
+    name = "car_objects",
+    srcs = ["car_objects.cpp", "classic_hid.cpp"],
+    hdrs = ["car_objects.hpp"],
+    deps = [
+        "//:btstack_config",
+        "//:ws2812_pio",
+        "@pico-sdk//src/rp2_common/hardware_clocks",
+        "@pico-sdk//src/rp2_common/hardware_gpio",
+        "@pico-sdk//src/rp2_common/hardware_pio",
+        "@pico-sdk//src/rp2_common/hardware_pwm",
+        "@pico-sdk//src/rp2_common/pico_btstack",
+        "@pico-sdk//src/rp2_common/pico_cyw43_arch:pico_cyw43_arch_poll",
+        "@pico-sdk//src/rp2_common/pico_stdlib",
+        "@shizuku//:internal_headers",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support:headers",
+    ],
+)
+
+cc_binary(
+    name = "car.elf",
+    srcs = ["main.cpp"],
+    deps = [
+        ":car_objects",
+        "@pico-sdk//src/rp2_common/pico_stdlib",
+        "@shizuku//:internal_headers",
+        "@shizuku//:kernel_object",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support",
+    ],
+)
+
+# ELF → UF2。Shizuku の //firmware:shizuku_uf2 と同じ事情 (Apple Silicon では
+# Bazel 製 picotool がビルドできない) で、ホストの picotool を使う (非 hermetic)。
+genrule(
+    name = "car_uf2",
+    srcs = [":car.elf"],
+    outs = ["car.uf2"],
+    cmd = "/opt/picotool/bin/picotool uf2 convert -t elf $(location :car.elf) $@",
+    tags = ["no-sandbox"],
+)

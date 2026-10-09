@@ -1,0 +1,15 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@pico-sdk//bazel:defs.bzl", "pico_generate_pio_header")
+
+cc_library(
+    name = "btstack_config",
+    hdrs = ["include/btstack_config.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+pico_generate_pio_header(
+    name = "ws2812_pio",
+    srcs = ["ws2812.pio"],
+    visibility = ["//firmware_bazel:__pkg__"],
+)

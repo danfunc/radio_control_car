@@ -1,0 +1,4 @@
+!.gitignore
+!.bazelrc
+.bazelrc.user
+bazel-*
