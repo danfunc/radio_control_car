@@ -1,0 +1,3 @@
+[deps.shizuku]
+path = "../Shizuku-v3"
+bazel_module = "shizuku"

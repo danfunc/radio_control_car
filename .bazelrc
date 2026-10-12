@@ -13,4 +13,8 @@ build --copt=-Og
 build --copt=-g3
 build --strip=never
 
+# ホスト環境ごとの picotool 選択 (Linux は Bazel 製、macOS は /opt/picotool)
+common --enable_platform_specific_config
+build:macos --define=picotool=host
+
 try-import %workspace%/.bazelrc.user

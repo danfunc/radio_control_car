@@ -18,3 +18,7 @@ register_toolchains(
     "@pico-sdk//bazel/toolchain:linux-x86_64-rp2350",
     "@pico-sdk//bazel/toolchain:linux-aarch64-rp2350",
 )
+
+# picotool (ELF → UF2 変換。//firmware_bazel:car_uf2 が tools として使う)
+bazel_dep(name = "picotool", version = "2.2.0")
+

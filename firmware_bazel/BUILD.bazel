@@ -33,12 +33,25 @@ cc_binary(
     ],
 )
 
-# ELF → UF2。Shizuku の //firmware:shizuku_uf2 と同じ事情 (Apple Silicon では
-# Bazel 製 picotool がビルドできない) で、ホストの picotool を使う (非 hermetic)。
+# ELF → UF2。
+# macOS (Apple Silicon) では pico-sdk 2.2.0 の src/host/hardware_sync が clang builtin
+# と衝突するため、macOS ではホストの /opt/picotool、Linux では Bazel 製 picotool を使う。
+config_setting(
+    name = "host_picotool",
+    define_values = {"picotool": "host"},
+)
+
 genrule(
     name = "car_uf2",
     srcs = [":car.elf"],
     outs = ["car.uf2"],
-    cmd = "/opt/picotool/bin/picotool uf2 convert -t elf $(location :car.elf) $@",
+    cmd = select({
+        ":host_picotool": "/opt/picotool/bin/picotool uf2 convert -t elf $(location :car.elf) $@",
+        "//conditions:default": "$(location @picotool//:picotool) uf2 convert -t elf $(location :car.elf) $@",
+    }),
     tags = ["no-sandbox"],
+    tools = select({
+        ":host_picotool": [],
+        "//conditions:default": ["@picotool//:picotool"],
+    }),
 )
