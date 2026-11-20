@@ -85,10 +85,16 @@ LE のボンドは 1 件だけで、ボンド済みなら新規ペアリング�
 ```
 # 1) 見つかるか (広告名 "Shizuku UART")
 python3 <Shizuku>/tools/ble_ota_send.py scan
-# 2) 送って反映 (車を USB で PC に挿した状態。--cdc-port は macOS なら /dev/cu.usbmodem*)
+# 2a) 初回 (その PC と車がまだボンドしていない): 車を USB で PC に挿し、CDC で承認させながら送る
+#     (--cdc-port は macOS なら /dev/cu.usbmodem*)
 python3 <Shizuku>/tools/ble_ota_send.py send bazel-bin/firmware_bazel/car.bin --commit \
         --cdc-port /dev/cu.usbmodemXXXX
+# 2b) 2 回目以降 (ボンド済みの同じ PC): USB は不要。保存済みの鍵で再暗号化すると認可される
+python3 <Shizuku>/tools/ble_ota_send.py send bazel-bin/firmware_bazel/car.bin --commit
 ```
+
+- USB が要るのは **最初のペアリング承認だけ**。ボンド済みの PC が再接続すると `reencryption complete -> authorized`
+  で OTA が許可される (`ble_uart.cpp` の `SM_EVENT_REENCRYPTION_COMPLETE`)。2b が無線だけで通るかは実機未確認。
 
 - `send` の主な引数 (実装 `ble_ota_send.py:913-928` から): `--mode {xnor,xnou}` (既定 xnor)、`--commit`
   (転送成功後に XNOC で flash へ反映して再起動)、`--address` (BLE アドレス。省略時は自動探索)、`--cdc-port`、
