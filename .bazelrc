@@ -1,12 +1,21 @@
-build --platforms=@pico-sdk//bazel/platform:rp2350
-build --@pico-sdk//bazel/config:PICO_BOARD=pico2_w
-build --@shizuku//configs:board=rp2350_pico2_w
-
-build --@pico-sdk//bazel/config:PICO_STDIO_USB=False
-build --@pico-sdk//bazel/config:PICO_TINYUSB_CONFIG=@shizuku//modules/pico_sdk_support:tusb_config
-build --@pico-sdk//bazel/config:PICO_CONFIG_EXTRA_HEADER=@shizuku//configs:pico_extra_config
-build --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=//:btstack_config
-build --@pico-sdk//bazel/config:PICO_BT_ENABLE_CLASSIC=True
+build:rp2350_pico2_w --platforms=@pico-sdk//bazel/platform:rp2350
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_BOARD=pico2_w
+build:rp2350_pico2_w --@shizuku//configs:board=rp2350_pico2_w
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_DEFAULT_LINKER_SCRIPT=@shizuku//firmware:board_linker_script
+# Shizuku が USB CDC の記述子を提供するため pico_stdio_usb は無効。
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_STDIO_USB=False
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_TINYUSB_CONFIG=@shizuku//modules/pico_sdk_support:tusb_config
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_CONFIG_EXTRA_HEADER=@shizuku//configs:pico_extra_config
+# BT core: BLE (NUS) + Classic (HID host) の和集合。--define=bt_classic=1 が bt_classic.cpp を有効にする。
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_BTSTACK_CONFIG=@shizuku//modules/pico_sdk_support:btstack_config_classic
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_BT_ENABLE_BLE=True
+build:rp2350_pico2_w --@pico-sdk//bazel/config:PICO_BT_ENABLE_CLASSIC=True
+build:rp2350_pico2_w --define=bt_classic=1
+# 車は selftest を使わない。selftest のオブジェクト名 (65 個) がオブジェクト番号の上限 72 を
+# 食うので、番号の生成から外す (@shizuku//:object_ids_hpp)。
+build:rp2350_pico2_w --define=skip_selftest=true
+# Shizuku の .bazelrc の --copt は依存側に効かないので、ここでも指定する。
+build:rp2350_pico2_w --copt=-DSHIZUKU_RP2350_SVC_BREAKDOWN=0
 
 build --cxxopt=-std=c++23
 build --copt=-Og
@@ -18,3 +27,5 @@ common --enable_platform_specific_config
 build:macos --define=picotool=host
 
 try-import %workspace%/.bazelrc.user
+# BOOTSEL 長押しでコントローラ登録し直し (gpio BOOTSEL_READ_PRESSED を有効にする)
+build:rp2350_pico2_w --@shizuku//configs:bootsel_support=enabled

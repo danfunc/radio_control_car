@@ -1,412 +1,450 @@
+// Switch Pro コン (互換機含む) の入力 → 車の指令。★BTstack には一切触らない。
+// Classic HID host は Shizuku の BT core (ble_uart の owner スレッド上の bt_classic) が
+// 持ち、ここは hid_rx / hid_tx の STREAM だけで話す (設計: bt-core-port/DESIGN.md)。
 #include "car_objects.hpp"
-#include "btstack_config.h"
-extern "C" {
-#include "btstack.h"
-#include "classic/hid_host.h"
-#include "classic/sdp_server.h"
-#include "gap.h"
-#include "hci.h"
-#include "l2cap.h"
-}
-#include <pico/cyw43_arch.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include "shizuku/kernel.hpp"
+#include "shizuku/object_api.hpp"
+#include "shizuku/objects/ble_uart.hpp"
+#include "shizuku/objects/bt_classic.hpp"
+#include "shizuku/objects/peripherals.hpp" // gpio_method::BOOTSEL_READ_PRESSED
+#include "shizuku/stream.hpp"
 
 namespace car {
+namespace {
+using shizuku::objects::bt_classic::hid_frame;
+namespace bc = shizuku::objects::bt_classic;
 
-// WS2812 は GRB 順 (旧 CYW43_BL_DRIVER.cpp と同じ)。
-static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
-  return ((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b);
-}
-
-static btstack_packet_callback_registration_t hci_event_callback_registration;
-static uint8_t hid_descriptor_storage[512];
 #ifndef REMOTE_BD_ADDR
 #define REMOTE_BD_ADDR 0x98, 0xB6, 0xB4, 0x74, 0xB1, 0x55
 #endif
-static bd_addr_t remote_addr = {REMOTE_BD_ADDR};
-static const uint8_t neutral_rumble[8] = {0x00, 0x01, 0x40, 0x40,
-                                          0x00, 0x01, 0x40, 0x40};
+constexpr uint8_t kRemoteAddr[6] = {REMOTE_BD_ADDR};
 
-enum InitState {
-  INIT_IDLE,
-  INIT_SET_MODE,
-  INIT_ENABLE_VIB,
-  INIT_SET_LED,
-  INIT_DONE
-};
+shizuku::stream::handle<hid_frame> g_tx; // 車 -> BT core
+shizuku::stream::handle<hid_frame> g_rx; // BT core -> 車
+uintptr_t g_tx_id = 0;
 
-static char pin_code[] = "0000";
-static uint16_t hid_cid = 0;
-static bool hid_protocol_set = false; // プロトコルモード設定フラグ
-static uint8_t output_counter = 0;
-static InitState init_state = INIT_IDLE;
-static bool init_started = false;
-// 入力が途切れたら車体を止める。切断イベントが来ない無線断 (電波切れ・コントローラの
-// 電池切れ) でも、最後の指令のまま走り続けないようにする。元の CMake 版には無い。
+enum InitState { INIT_IDLE, INIT_SET_MODE, INIT_SET_LED, INIT_DONE };
+// 初期化の各段 (0x03 入力モード → 0x30 LED) は ACK/NAK か、この時間の無応答で次へ進む。
+// 互換機は応答しない・NAK を返すことがあるので止まらないようにする。振動有効化 (0x48)
+// は振動なしの機体なので送らない。
+constexpr uint64_t kInitStageTimeoutUs = 300000;
+uint64_t init_stage_us = 0;
+InitState init_state = INIT_IDLE;
+bool init_started = false;
+bool hid_open = false;
+uint8_t output_counter = 0;
+
+// 速度レベル。既定は最大速度の 1/2。十字キー上で一段上げ、下で一段下げ。
+const double kSpeedScale[] = {0.5, 0.75, 1.0};
+const char *const kSpeedName[] = {"1/2", "3/4", "1"};
+constexpr int kSpeedLevels = 3;
+int speed_level = 0;
+bool dpad_up_prev = false;
+bool dpad_down_prev = false;
+
+// 入力が途切れたら車体を止める (切断イベントが来ない無線断でも走り続けない)。
 constexpr uint64_t kReportTimeoutUs = 500000;
-static uint64_t last_report_us = 0;
-static bool motors_active = false;
-static uint32_t motor_log_divider = 0;
+uint64_t last_report_us = 0;
+bool motors_active = false;
+uint32_t motor_log_divider = 0;
 
-static void stop_motors() {
-  constexpr uintptr_t motor_ids[] = {id::motor_fl, id::motor_fr, id::motor_rl,
-                                     id::motor_rr};
-  for (const uintptr_t motor : motor_ids)
-    call(motor, (uintptr_t)motor_method::set_speed, 1000);
+uint64_t now_us() { return shizuku::KERNEL::BOARD::time_us(); }
+uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+  return ((uint32_t)r << 8) | ((uint32_t)g << 16) | (uint32_t)b;
+}
+
+void stop_motors() {
+  for (uintptr_t p = 0; p < 4; ++p)
+    call(id::io, (uintptr_t)io_method::set_motor, motor_arg(p, 1000));
   motors_active = false;
 }
 
-// サブコマンド送信用の関数
-static void send_subcommand(uint16_t hid_cid, uint8_t subcommand, uint8_t *args,
-                            uint8_t arg_len) {
-  uint8_t payload[64];
-  memset(payload, 0, sizeof(payload));
+void send_frame(uint8_t kind, const uint8_t *data, uint8_t len) {
+  hid_frame f;
+  memset(&f, 0, sizeof(f));
+  f.kind = kind;
+  f.len = len;
+  if (len != 0) memcpy(f.data, data, len);
+  g_tx.push(f);
+}
 
-  // Nintendo Switch Pro Controller サブコマンド形式：
-  // report_idが先頭に付与される（hid_host_send_set_report経由）
-  // [0]: Packet Counter (report本体の先頭)
-  // [1-8]: Rumble (8 bytes) - neutral: 0x00,0x01,0x40,0x40,0x00,0x01,0x40,0x40
-  // [9]: SubcommandID
-  // [10+]: Arguments
+// Pro コンのサブコマンド (OUTPUT report 0x01):
+// [0x01][counter][rumble x8 (neutral)][subcommand][args...]。report id は
+// bt_classic の TX_SET_REPORT の data[0]。
+void send_subcommand(uint8_t subcommand, const uint8_t *args, uint8_t arg_len) {
+  static const uint8_t neutral_rumble[8] = {0x00, 0x01, 0x40, 0x40,
+                                            0x00, 0x01, 0x40, 0x40};
+  uint8_t buf[1 + 1 + 8 + 1 + 8];
+  if (arg_len > 8) arg_len = 8;
+  uint8_t n = 0;
+  buf[n++] = 0x01;
+  buf[n++] = output_counter++ & 0x0F;
+  memcpy(&buf[n], neutral_rumble, 8);
+  n += 8;
+  buf[n++] = subcommand;
+  if (arg_len != 0) { memcpy(&buf[n], args, arg_len); n += arg_len; }
+  send_frame(bc::TX_SET_REPORT, buf, n);
+}
 
-  payload[0] = output_counter & 0x0F;
-  output_counter++;
+void init_send_led(const char *why) {
+  std::printf("[CAR] init: 0x03 stage end (%s) -> LED player 1 (0x30 0x01)\n", why);
+  init_state = INIT_SET_LED;
+  init_stage_us = now_us();
+  const uint8_t arg = 0x01; // bit0 のみ = プレイヤー 1
+  send_subcommand(0x30, &arg, 1);
+}
+void init_finish(const char *why) {
+  std::printf("[CAR] init: LED stage end (%s) -> init complete\n", why);
+  init_state = INIT_DONE;
+}
+void init_poll() {
+  if (init_state != INIT_SET_MODE && init_state != INIT_SET_LED) return;
+  if (now_us() - init_stage_us <= kInitStageTimeoutUs) return;
+  if (init_state == INIT_SET_MODE) init_send_led("timeout 300ms");
+  else init_finish("timeout 300ms");
+}
 
-  // ニュートラルランブル設定
-  payload[1] = 0x00;
-  payload[2] = 0x01;
-  payload[3] = 0x40;
-  payload[4] = 0x40;
-  payload[5] = 0x00;
-  payload[6] = 0x01;
-  payload[7] = 0x40;
-  payload[8] = 0x40;
-
-  // サブコマンド
-  payload[9] = subcommand;
-  if (arg_len > 0 && args != nullptr) {
-    memcpy(&payload[10], args, arg_len);
-  }
-
-  uint16_t payload_len = 10 + arg_len;
-
-  printf("Sending HID SET_REPORT subcommand 0x%02x (len=%d): ", subcommand,
-         payload_len);
-  for (int i = 0; i < payload_len; i++) {
-    printf("%02x ", payload[i]);
-  }
-  printf("\n");
-
-  // BTStack HID APIを使用
-  // 第3引数のreport_idで0x01を指定すると、先頭に0x01が自動付与される
-  // 最終的にプロコンに届くデータ：
-  // [0x01] + payload = [0x01][packet_counter][rumble][subcommand][args]
-  uint8_t send_result = hid_host_send_set_report(
-      hid_cid, hid_report_type_t::HID_REPORT_TYPE_OUTPUT, 0x01, payload,
-      payload_len);
-  if (send_result == ERROR_CODE_SUCCESS) {
-    printf("send_success\n");
+// 十字キー上下の押した瞬間だけ速度レベルを変える。ビット位置は推定:
+//  - 0x30/0x21 フルモード: report[6] が左側ボタン (down=0x01, up=0x02)。
+//  - 0x3F 簡易モード: report[4] が hat (0=上, 4=下 ...)。
+void handle_dpad(const uint8_t *report, uint16_t len, uint8_t report_id) {
+  bool up, down;
+  if (report_id == 0x3F) {
+    const uint8_t hat = report[4];
+    up = (hat == 0 || hat == 1 || hat == 7);
+    down = (hat == 3 || hat == 4 || hat == 5);
   } else {
-    printf("send_failed\n");
+    up = (report[6] & 0x02) != 0;
+    down = (report[6] & 0x01) != 0;
   }
+  if (up == dpad_up_prev && down == dpad_down_prev) return;
+  std::printf("[CAR] dpad: id=%02x report[4]=%02x report[6]=%02x up=%d down=%d len=%u\n",
+              report_id, report[4], report[6], up, down, (unsigned)len);
+  if (up && !dpad_up_prev && speed_level < kSpeedLevels - 1) {
+    speed_level++;
+    std::printf("[CAR] speed level up -> %s\n", kSpeedName[speed_level]);
+  }
+  if (down && !dpad_down_prev && speed_level > 0) {
+    speed_level--;
+    std::printf("[CAR] speed level down -> %s\n", kSpeedName[speed_level]);
+  }
+  dpad_up_prev = up;
+  dpad_down_prev = down;
 }
 
-// LED設定
-static void send_player_led(uint16_t hid_cid) {
-  uint8_t arg = 0x0F; // LED1 ON
-  send_subcommand(hid_cid, 0x30, &arg, 1);
-}
-
-// 振動機能有効化
-static void send_enable_vibration(uint16_t hid_cid) {
-  uint8_t arg = 0x01; // Enable
-  send_subcommand(hid_cid, 0x48, &arg, 1);
-}
-
-// 入力モード設定
-static void send_set_input_report_mode(uint16_t hid_cid) {
-  uint8_t arg = 0x30; // standard full mode
-  send_subcommand(hid_cid, 0x03, &arg, 1);
-}
-
-static void packet_handler(uint8_t packet_type, uint16_t channel,
-                           uint8_t *packet, uint16_t size) {
-  if (packet_type != HCI_EVENT_PACKET)
+void on_report(const uint8_t *report, uint16_t len) {
+  if (len < 13 || report[0] != 0xA1 ||
+      !(report[1] == 0x3F || report[1] == 0x21 || report[1] == 0x30))
     return;
+  const uint8_t report_id = report[1];
+  int32_t lx, ly, rx, ry;
+  if (report_id == 0x3F) { // Standard Mode: 16bit -> 12bit
+    lx = (report[5] | (report[6] << 8)) >> 4;
+    ly = (report[7] | (report[8] << 8)) >> 4;
+    rx = (report[9] | (report[10] << 8)) >> 4;
+    ry = (report[11] | (report[12] << 8)) >> 4;
+  } else { // Full Mode: 12bit packed
+    lx = report[7] | ((report[8] & 0xf) << 8);
+    ly = ((report[8] & 0xf0) >> 4) | (report[9] << 4);
+    rx = report[10] | ((report[11] & 0xf) << 8);
+    ry = ((report[11] & 0xf0) >> 4) | (report[12] << 4);
+  }
+  lx -= 2048; ly -= 2048; rx -= 2048; ry -= 2048;
 
-  uint8_t event = hci_event_packet_get_type(packet);
+  double FL = (rx - (ly + ry) + lx) / 2;
+  double FR = (-rx - (ly + ry) - lx) / 2;
+  double RL = (-rx - (ly + ry) + lx) / 2;
+  double RR = (+rx - (ly + ry) - lx) / 2;
+  double maxVal = fabs(FL);
+  if (fabs(FR) > maxVal) maxVal = fabs(FR);
+  if (fabs(RL) > maxVal) maxVal = fabs(RL);
+  if (fabs(RR) > maxVal) maxVal = fabs(RR);
+  if (maxVal > 1000) {
+    FL = FL / maxVal * 1000; FR = FR / maxVal * 1000;
+    RL = RL / maxVal * 1000; RR = RR / maxVal * 1000;
+  }
+  handle_dpad(report, len, report_id);
+  const double scale = kSpeedScale[speed_level];
+  const double v[4] = {FL * scale, FR * scale, RL * scale, RR * scale};
+  for (uintptr_t p = 0; p < 4; ++p)
+    call(id::io, (uintptr_t)io_method::set_motor, motor_arg(p, (uintptr_t)(v[p] + 1000)));
+  last_report_us = now_us();
+  motors_active = true;
+  if (++motor_log_divider % 32 == 0)
+    std::printf("Motor: FL:%4ld FR:%4ld RL:%4ld RR:%4ld\n", (long)v[0], (long)v[1],
+                (long)v[2], (long)v[3]);
 
-  switch (event) {
+  if (report_id == 0x3F) { // 初期状態 (簡易モード) が来たら入力モードを切り替える
+    if (!init_started && hid_open) {
+      std::printf("[CAR] simple mode (3F) detected, starting init (0x03 0x30)\n");
+      init_started = true;
+      init_state = INIT_SET_MODE;
+      init_stage_us = now_us();
+      const uint8_t arg = 0x30; // standard full mode
+      send_subcommand(0x03, &arg, 1);
+    }
+  } else if (report_id == 0x21 && len >= 15) { // サブコマンドへの返事
+    const bool is_ack = (report[13] & 0x80) != 0;
+    const uint8_t replied = report[14];
+    std::printf("[CAR] %s for cmd 0x%02x\n", is_ack ? "ACK" : "NAK", replied);
+    // ACK でも NAK でも次の段へ進む (互換機で止まらないように)。
+    if (init_state == INIT_SET_MODE && replied == 0x03) init_send_led(is_ack ? "ACK" : "NAK");
+    else if (init_state == INIT_SET_LED && replied == 0x30) init_finish(is_ack ? "ACK" : "NAK");
+  } else if (report_id == 0x30 && init_state == INIT_DONE) {
+    // フルモードのデータ = 準備完了
+  }
+}
 
-  case BTSTACK_EVENT_STATE: {
-    printf("BTSTACK_EVENT_STATE\n");
-    if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-      // HCI ready → 接続開始
-      hid_host_connect(remote_addr, HID_PROTOCOL_MODE_REPORT, &hid_cid);
+// ---- コントローラの登録し直し (BOOTSEL 3 秒長押し) --------------------------------
+// ★実機未検証の仮実装。IF (bc::TX_FORGET / TX_SCAN_* / TX_LIST_BONDS と RX_SCAN_* / RX_BOND*)
+//   は DESIGN.md「コントローラの登録し直し」に合わせてある。
+// 状態遷移:
+//   STARTUP --RX_BOND_END (か 15 秒待ち切れ)--> NORMAL : bond があればその相手へ、なければ既定へ TX_CONNECT
+//   NORMAL  --BOOTSEL 3 秒--> SCAN : モーター停止、TX_FORGET(全) → TX_SCAN_START(30 秒)
+//   SCAN    --RX_SCAN_FOUND (ゲームパッド CoD)--> PAIRING : TX_CONNECT(その相手)
+//   SCAN    --RX_SCAN_DONE (見つからず)/ 40 秒超過--> NORMAL : 既定アドレスへ TX_CONNECT
+//   PAIRING --RX_SCAN_DONE(1) / RX_OPENED--> NORMAL (接続はカーネルが続ける)
+// 起動直後の BOOTSEL 押下は USB ブートローダになるので、起動後の長押しだけを見る。
+enum RegMode { REG_STARTUP, REG_NORMAL, REG_SCAN, REG_PAIRING };
+RegMode reg_mode = REG_STARTUP;
+constexpr uint64_t kBootselPollUs = 100000;
+constexpr uint64_t kBootselHoldUs = 3000000;
+constexpr uint8_t kScanSeconds = 30;
+constexpr uint64_t kScanGuardUs = (uint64_t)(kScanSeconds + 10) * 1000000ull;
+constexpr uint64_t kBondQueryTimeoutUs = 15000000;
+constexpr uint64_t kScanBlinkUs = 250000;
+uint64_t reg_stage_us = 0;     // STARTUP / SCAN に入った時刻
+uint64_t bootsel_poll_us = 0;
+uint64_t bootsel_down_us = 0;  // 押し始めた時刻 (0 = 押していない)
+bool bootsel_fired = false;    // 長押し成立済み (離すまで再発火しない)
+bool bootsel_available = true; // gpio object が無い等で読めなければ以後読まない
+uint64_t blink_us = 0;
+bool blink_on = false;
+uint8_t bond_count = 0;
+uint8_t first_bond[6] = {};
+bool bond_is_default = false;
+
+void connect_to(const uint8_t *addr) {
+  std::printf("[CAR] connect %02x:%02x:%02x:%02x:%02x:%02x\n", addr[0], addr[1], addr[2],
+              addr[3], addr[4], addr[5]);
+  send_frame(bc::TX_CONNECT, addr, 6);
+}
+
+void enter_normal_and_connect_default(const char *why) {
+  std::printf("[CAR] reregister: back to default target (%s)\n", why);
+  reg_mode = REG_NORMAL;
+  connect_to(kRemoteAddr);
+}
+
+void start_reregister() {
+  std::printf("[CAR] BOOTSEL long press: forget bonds and scan for a new controller\n");
+  stop_motors();
+  send_frame(bc::TX_FORGET, nullptr, 0);
+  const uint8_t sec = kScanSeconds;
+  send_frame(bc::TX_SCAN_START, &sec, 1);
+  reg_mode = REG_SCAN;
+  reg_stage_us = now_us();
+  blink_us = reg_stage_us;
+  blink_on = true;
+  call(id::io, (uintptr_t)io_method::set_central, urgb_u32(255, 160, 0)); // 琥珀 = 探索中
+}
+
+// ゲームパッド / ジョイスティック (Peripheral の major 0x05、minor の bit2..5 が 1 or 2)。
+bool cod_is_gamepad(const uint8_t *cod) {
+  const uint32_t v = ((uint32_t)cod[0] << 16) | ((uint32_t)cod[1] << 8) | cod[2];
+  const uint32_t major = (v >> 8) & 0x1F;
+  const uint32_t minor = (v >> 2) & 0x0F;
+  return major == 0x05 && (minor == 0x01 || minor == 0x02);
+}
+
+bool read_bootsel(bool &pressed) {
+  const auto r = call(shizuku::object_id::gpio,
+                      (uintptr_t)shizuku::objects::gpio_method::BOOTSEL_READ_PRESSED);
+  if (r.error != 0) return false;
+  pressed = r.value != 0;
+  return true;
+}
+
+// BOOTSEL を約 100 ms 周期で読み、3 秒の長押しで 1 回だけ登録し直しへ入る。
+void bootsel_poll() {
+  if (!bootsel_available || reg_mode != REG_NORMAL) return;
+  const uint64_t t = now_us();
+  if (t - bootsel_poll_us < kBootselPollUs) return;
+  bootsel_poll_us = t;
+  bool pressed = false;
+  if (!read_bootsel(pressed)) {
+    std::printf("[CAR] BOOTSEL read unavailable (gpio object / SHIZUKU_ENABLE_BOOTSEL?)\n");
+    bootsel_available = false;
+    return;
+  }
+  if (!pressed) {
+    bootsel_down_us = 0;
+    bootsel_fired = false;
+    return;
+  }
+  if (bootsel_down_us == 0) bootsel_down_us = t;
+  if (!bootsel_fired && t - bootsel_down_us >= kBootselHoldUs) {
+    bootsel_fired = true;
+    start_reregister();
+  }
+}
+
+// 起動時の bond 問い合わせの待ち切れ、スキャンの暴走防止、探索中の LED 点滅。
+void reg_poll() {
+  const uint64_t t = now_us();
+  if (reg_mode == REG_STARTUP && t - reg_stage_us > kBondQueryTimeoutUs) {
+    std::printf("[CAR] no RX_BOND_END (kernel without bond IF?)\n");
+    enter_normal_and_connect_default("bond query timeout");
+  } else if (reg_mode == REG_SCAN) {
+    if (t - reg_stage_us > kScanGuardUs) {
+      send_frame(bc::TX_SCAN_STOP, nullptr, 0);
+      enter_normal_and_connect_default("scan guard timeout");
+    } else if (t - blink_us >= kScanBlinkUs) {
+      blink_us = t;
+      blink_on = !blink_on;
+      call(id::io, (uintptr_t)io_method::set_central,
+           blink_on ? urgb_u32(255, 160, 0) : 0);
+    }
+  }
+}
+
+void on_reg_frame(const hid_frame &f) {
+  switch (f.kind) {
+  case bc::RX_BOND:
+    if (f.len < 6) break;
+    std::printf("[CAR] bond %02x:%02x:%02x:%02x:%02x:%02x\n", f.data[0], f.data[1],
+                f.data[2], f.data[3], f.data[4], f.data[5]);
+    if (bond_count == 0 || (!bond_is_default && memcmp(f.data, kRemoteAddr, 6) == 0)) {
+      memcpy(first_bond, f.data, 6); // 既定アドレスの bond があればそれを優先、なければ最初の 1 件
+      bond_is_default = memcmp(f.data, kRemoteAddr, 6) == 0;
+    }
+    if (bond_count < 255) ++bond_count;
+    break;
+  case bc::RX_BOND_END:
+    if (reg_mode != REG_STARTUP) break;
+    std::printf("[CAR] bonds=%u\n", (unsigned)bond_count);
+    reg_mode = REG_NORMAL;
+    connect_to(bond_count != 0 ? first_bond : kRemoteAddr);
+    break;
+  case bc::RX_SCAN_FOUND:
+    if (reg_mode != REG_SCAN || f.len < 9) break;
+    std::printf("[CAR] scan found %02x:%02x:%02x:%02x:%02x:%02x cod=%02x%02x%02x\n",
+                f.data[0], f.data[1], f.data[2], f.data[3], f.data[4], f.data[5],
+                f.data[6], f.data[7], f.data[8]);
+    if (cod_is_gamepad(&f.data[6])) {
+      reg_mode = REG_PAIRING;
+      call(id::io, (uintptr_t)io_method::set_central, urgb_u32(255, 255, 255)); // 白 = 接続中
+      connect_to(f.data); // カーネルが inquiry を止めて、完了後にこの相手へ接続する
     }
     break;
-  }
-
-  case HCI_EVENT_PIN_CODE_REQUEST: {
-    bd_addr_t addr;
-    hci_event_pin_code_request_get_bd_addr(packet, addr);
-    printf("HCI_EVENT_PIN_CODE_REQUEST\naddr: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-    gap_pin_code_response(addr, pin_code);
-    break;
-  }
-
-  case HCI_EVENT_USER_CONFIRMATION_REQUEST: {
-    bd_addr_t addr;
-    hci_event_user_confirmation_request_get_bd_addr(packet, addr);
-    printf("HCI_EVENT_USER_CONFIRMATION_REQUEST\naddr: "
-           "%02x:%02x:%02x:%02x:%02x:%02x\n",
-           addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-    gap_ssp_confirmation_response(addr);
-    break;
-  }
-
-  case HCI_EVENT_LINK_KEY_REQUEST: {
-    bd_addr_t addr;
-    hci_event_link_key_request_get_bd_addr(packet, addr);
-    printf("HCI_EVENT_LINK_KEY_REQUEST\naddr: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-    // 保存していないので否定
-    // gap_send_link_key_response(addr,NULL,INVALID_LINK_KEY);
-    hci_send_cmd(&hci_link_key_request_negative_reply, addr);
-    break;
-  }
-
-  case HCI_EVENT_LINK_KEY_NOTIFICATION: {
-    // RAMに保存するならここ
-    printf("HCI_EVENT_LINK_KEY_NOTIFICATION\n");
-    break;
-  }
-
-  case HCI_EVENT_AUTHENTICATION_COMPLETE: {
-    if (hci_event_authentication_complete_get_status(packet) !=
-        ERROR_CODE_SUCCESS) {
-      // 認証失敗
-      printf("HCI_EVENT_AUTHENTICATION_COMPLETE:Failed\n");
-      hid_host_connect(remote_addr, HID_PROTOCOL_MODE_REPORT, &hid_cid);
-    } else {
-      printf("HCI_EVENT_AUTHENTICATION_COMPLETE:Success\n");
+  case bc::RX_SCAN_DONE:
+    std::printf("[CAR] scan done reason=%u\n", f.len ? (unsigned)f.data[0] : 0u);
+    if (reg_mode == REG_SCAN) {
+      call(id::io, (uintptr_t)io_method::set_central, 0);
+      enter_normal_and_connect_default("no gamepad found");
+    } else if (reg_mode == REG_PAIRING) {
+      reg_mode = REG_NORMAL; // 以後の接続はカーネルが target (見つけた相手) で続ける
     }
     break;
-  }
-
-  case HCI_EVENT_CONNECTION_COMPLETE: {
-    if (hci_event_connection_complete_get_status(packet) !=
-        ERROR_CODE_SUCCESS) {
-      // 接続失敗
-      printf("HCI_EVENT_CONNECTION_COMPLETE:Not Success\n");
-    } else {
-      printf("HCI_EVENT_CONNECTION_COMPLETE:Success\n");
-    }
+  default:
     break;
   }
+}
 
-  case HCI_EVENT_DISCONNECTION_COMPLETE: {
-    // デモ用途なら即再接続
-    hid_cid = 0;
-    hid_protocol_set = false;
+void on_frame(const hid_frame &f) {
+  switch (f.kind) {
+  case bc::RX_BOND:
+  case bc::RX_BOND_END:
+  case bc::RX_SCAN_FOUND:
+  case bc::RX_SCAN_DONE:
+    on_reg_frame(f);
+    return;
+  default:
+    break;
+  }
+  switch (f.kind) {
+  case bc::RX_OPENED:
+    std::printf("[CAR] HID opened\n");
+    if (reg_mode == REG_PAIRING) reg_mode = REG_NORMAL;
+    hid_open = true;
     init_started = false;
     init_state = INIT_IDLE;
+    call(id::io, (uintptr_t)io_method::set_central, urgb_u32(0, 0, 255));
+    break;
+  case bc::RX_CLOSED:
+    std::printf("[CAR] HID closed (reason=0x%02x)\n", f.len ? f.data[0] : 0);
+    hid_open = false;
+    init_started = false;
+    init_state = INIT_IDLE;
+    dpad_up_prev = dpad_down_prev = false;
     stop_motors();
-    printf("HCI_EVENT_DISCONNECTION_COMPLETE\nreconnecting...\n");
-    hid_host_connect(remote_addr, HID_PROTOCOL_MODE_REPORT, &hid_cid);
+    call(id::io, (uintptr_t)io_method::set_central, 0);
     break;
-  }
-
-  case HCI_EVENT_HID_META: {
-    // printf("HCI_EVENT_HID_META\n");
-    switch (hci_event_hid_meta_get_subevent_code(packet)) {
-    case HID_SUBEVENT_REPORT: {
-      const uint8_t *report = hid_subevent_report_get_report(packet);
-      uint16_t len = hid_subevent_report_get_report_len(packet);
-      if (len >= 13 && report[0] == 0xA1 &&
-          (report[1] == 0x3F || report[1] == 0x21 || report[1] == 0x30)) {
-        uint8_t report_id = report[1];
-        int32_t lx, ly, rx, ry;
-        if (report_id == 0x3F) {
-          // Standard Mode (0x3F): 16-bit values. Shift to 12-bit scale (0-4095)
-          // for display.
-          lx = (report[5] | (report[6] << 8)) >> 4;
-          ly = (report[7] | (report[8] << 8)) >> 4;
-          rx = (report[9] | (report[10] << 8)) >> 4;
-          ry = (report[11] | (report[12] << 8)) >> 4;
-        } else {
-          // Full Mode (0x30): 12-bit packed values.
-          lx = report[7] | ((report[8] & 0xf) << 8);
-          ly = ((report[8] & 0xf0) >> 4) | (report[9] << 4);
-          rx = report[10] | ((report[11] & 0xf) << 8);
-          ry = ((report[11] & 0xf0) >> 4) | (report[12] << 4);
-        }
-        // printf("\033[2K\rStick: %4ld %4ld %4ld %4ld\n", lx, ly, rx, ry);
-        lx -= 2048;
-        ly -= 2048;
-        rx -= 2048;
-        ry -= 2048;
-
-        double FL = (rx - (ly + ry) + lx) / 2;
-        double FR = (-rx - (ly + ry) - lx) / 2;
-        double RL = (-rx - (ly + ry) + lx) / 2;
-        double RR = (+rx - (ly + ry) - lx) / 2;
-
-        double maxVal = fabs(FL);
-
-        if (fabs(FR) > maxVal)
-          maxVal = fabs(FR);
-        if (fabs(RL) > maxVal)
-          maxVal = fabs(RL);
-        if (fabs(RR) > maxVal)
-          maxVal = fabs(RR);
-        if (maxVal > 1000) {
-
-          FL /= maxVal;
-          FR /= maxVal;
-          RL /= maxVal;
-          RR /= maxVal;
-          FL *= 1000;
-          FR *= 1000;
-          RL *= 1000;
-          RR *= 1000;
-        }
-        call(id::motor_fl, (uintptr_t)motor_method::set_speed,
-             (uintptr_t)(FL + 1000));
-        call(id::motor_fr, (uintptr_t)motor_method::set_speed,
-             (uintptr_t)(FR + 1000));
-        call(id::motor_rl, (uintptr_t)motor_method::set_speed,
-             (uintptr_t)(RL + 1000));
-        call(id::motor_rr, (uintptr_t)motor_method::set_speed,
-             (uintptr_t)(RR + 1000));
-        last_report_us = shizuku::KERNEL::BOARD::time_us();
-        motors_active = true;
-        // 1 レポートごとに CDC へ書くと割込み禁止区間が増えるので間引く。
-        if (++motor_log_divider % 32 == 0)
-          printf("Motor: FL:%4ld FR:%4ld RL:%4ld RR:%4ld\n", (int32_t)FL,
-                 (int32_t)FR, (int32_t)RL, (int32_t)RR);
-
-        // obj_api::yield_us(10000);
-
-        // ① 初期状態 (3F) のデータが来た！
-        if (report_id == 0x3F) {
-          // プロトコルモード設定後に初期化を開始
-          if (!init_started && hid_protocol_set) {
-            printf("Simple Mode (3F) detected! Starting initialization...\n");
-            init_started = true;
-            init_state = INIT_SET_MODE;
-            send_set_input_report_mode(hid_cid);
-          }
-        }
-        // ② サブコマンドへの返事 (21) が来た！
-        else if (report_id == 0x21 && len >= 15) {
-          uint8_t ack = report[13];         // ACK byte
-          uint8_t replied_cmd = report[14]; // Replied subcommand ID
-
-          if ((ack & 0x80) != 0) {
-            printf("ACK received for cmd: 0x%02x\n", replied_cmd);
-
-            // ステートマシンに基づいて次のコマンドを送信
-            if (init_state == INIT_SET_MODE && replied_cmd == 0x03) {
-              printf("Input mode set to full mode. Enabling vibration...\n");
-              init_state = INIT_ENABLE_VIB;
-              send_enable_vibration(hid_cid);
-            } else if (init_state == INIT_ENABLE_VIB && replied_cmd == 0x48) {
-              printf("Vibration enabled. Setting LED...\n");
-              init_state = INIT_SET_LED;
-              send_player_led(hid_cid);
-            } else if (init_state == INIT_SET_LED && replied_cmd == 0x30) {
-              printf("LED set. Initialization complete!\n");
-              init_state = INIT_DONE;
-            }
-          } else {
-            printf("NAK received for cmd: 0x%02x\n", replied_cmd);
-          }
-        }
-        // ③ フルモード (30) のデータが来た！
-        else if (report_id == 0x30) {
-          if (init_state == INIT_DONE) {
-            printf("Full Mode report received. Controller ready!\n");
-          }
-        }
-      }
-      break;
-    }
-    case HID_SUBEVENT_SET_REPORT_RESPONSE: {
-      printf("HID_SUBEVENT_SET_REPORT_RESPONSE\n");
-      auto status =
-          hid_subevent_set_report_response_get_handshake_status(packet);
-      if (status == HID_HANDSHAKE_PARAM_TYPE_SUCCESSFUL) {
-        printf("HID_HANDSHAKE_PARAM_TYPE_SUCCESSFUL\n");
-        // フロー制御はHID_SUBEVENT_REPORT側で行うため、ここでは送信しない
-        // send_player_led(hid_cid);
-      }
-      break;
-    }
-    case HID_SUBEVENT_CONNECTION_OPENED:
-      printf("HID_SUBEVENT_CONNECTION_OPENED\n");
-      if (hid_subevent_connection_opened_get_status(packet) ==
-          ERROR_CODE_SUCCESS) {
-        hid_cid = hid_subevent_connection_opened_get_hid_cid(packet);
-        printf("HID Connected! HID CID: %04x\n", hid_cid);
-        call(id::ws2812,
-                    (uintptr_t)pixel_method::set_central,
-                    urgb_u32(0, 0, 255));
-
-        // プロトコルモードを明示的に設定（シンプルモード→レポートモード）
-        printf("Setting HID protocol mode to REPORT...\n");
-        hid_host_send_set_protocol_mode(hid_cid, HID_PROTOCOL_MODE_REPORT);
-        hid_protocol_set = true;
-      }
-      break;
-    }
+  case bc::RX_REPORT:
+    if (reg_mode == REG_SCAN) break; // 切断イベントが来るまでの残りの入力でモーターを動かさない
+    on_report(f.data, f.len);
     break;
-  }
-
   default:
     break;
   }
 }
 
 uintptr_t hid_poll(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
-
-  if (cyw43_arch_init() != 0) {
-    shizuku::KERNEL::BOARD::diag_printf("[CAR] CYW43 init failed\n");
+  using shizuku::objects::ble_uart::method;
+  const uintptr_t ble = shizuku::object_id::ble_uart;
+  // ★席に座るのはこのスレッド (STREAM_BIND は発行元オブジェクトから席を導出する)。
+  api(shizuku::object_api::STREAM_BIND, g_tx_id,
+      (uintptr_t)shizuku::stream::role::PRODUCER);
+  const auto rx_id = call(ble, (uintptr_t)method::GET_HID_RX_STREAM);
+  if (rx_id.error != 0 || rx_id.value == 0) {
+    std::printf("[CAR] no hid_rx stream (BT core without SHIZUKU_BT_CLASSIC?)\n");
     return 1;
   }
+  const auto opened = api(shizuku::object_api::STREAM_OPEN, rx_id.value);
+  if (opened.error != 0 || opened.value == 0) {
+    std::printf("[CAR] hid_rx open failed (%lu)\n", (unsigned long)opened.error);
+    return 1;
+  }
+  g_rx = shizuku::stream::handle<hid_frame>(opened.value);
+  api(shizuku::object_api::STREAM_BIND, rx_id.value,
+      (uintptr_t)shizuku::stream::role::CONSUMER);
 
-  l2cap_init();
-  sdp_init();
-  hid_host_init(hid_descriptor_storage, sizeof(hid_descriptor_storage));
+  // まず保存済みの相手 (bond) を尋ねる。RX_BOND_END で接続先 (bond があればその相手、
+  // なければ既定の REMOTE_BD_ADDR) を TX_CONNECT する (on_reg_frame)。接続は BT core が
+  // HCI_STATE_WORKING のイベントから始め、再試行も BTstack のタイマーで行う。
+  reg_mode = REG_STARTUP;
+  reg_stage_us = now_us();
+  send_frame(bc::TX_LIST_BONDS, nullptr, 0);
 
-  hid_host_register_packet_handler(packet_handler);
-
-  hci_event_callback_registration.callback = &packet_handler;
-  hci_add_event_handler(&hci_event_callback_registration);
-  hci_power_control(HCI_POWER_ON);
-
+  hid_frame f;
   while (true) {
-    // Also poll the cyw43 driver
-    cyw43_arch_poll();
-    // 0x3F (簡易モード) は変化があったときしか送られないので、毎周期レポートが
-    // 流れる 0x30 に入った (INIT_DONE) 後だけ無通信を異常とみなす。
+    while (g_rx.available() != 0 && g_rx.pop(&f)) on_frame(f);
+    init_poll();
+    bootsel_poll();
+    reg_poll();
+    // 0x3F は変化があったときしか来ないので、毎周期流れる 0x30 に入った後だけ
+    // 無通信を異常とみなす。
     if (motors_active && init_state == INIT_DONE &&
-        shizuku::KERNEL::BOARD::time_us() - last_report_us > kReportTimeoutUs) {
-      printf("[CAR] controller report timeout; stopping motors\n");
+        now_us() - last_report_us > kReportTimeoutUs) {
+      std::printf("[CAR] controller report timeout; stopping motors\n");
       stop_motors();
     }
-    // 他のスレッドにCPU時間を譲る
     api(shizuku::object_api::SLEEP_US, 1000);
   }
 }
+} // namespace
+
+uintptr_t hid_tx_stream_id() { return g_tx_id; }
 
 uintptr_t hid_main(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
+  const auto tx = api(shizuku::object_api::STREAM_CREATE, sizeof(hid_frame), 16, 0);
+  if (tx.error != 0) return 1;
+  g_tx_id = tx.value;
+  g_tx = shizuku::stream::handle<hid_frame>(g_tx_id);
   return api(shizuku::object_api::EXPORT_METHOD, (uintptr_t)hid_method::poll,
              (uintptr_t)&hid_poll).error;
 }
-
 } // namespace car

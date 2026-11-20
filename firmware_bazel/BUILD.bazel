@@ -1,35 +1,43 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@pico-sdk//bazel/toolchain:objcopy.bzl", "objcopy_to_bin")
 
 cc_library(
     name = "car_objects",
     srcs = ["car_objects.cpp", "classic_hid.cpp"],
+    alwayslink = True,
     hdrs = ["car_objects.hpp"],
     deps = [
-        "//:btstack_config",
         "//:ws2812_pio",
         "@pico-sdk//src/rp2_common/hardware_clocks",
         "@pico-sdk//src/rp2_common/hardware_gpio",
         "@pico-sdk//src/rp2_common/hardware_pio",
         "@pico-sdk//src/rp2_common/hardware_pwm",
-        "@pico-sdk//src/rp2_common/pico_btstack",
-        "@pico-sdk//src/rp2_common/pico_cyw43_arch:pico_cyw43_arch_poll",
         "@pico-sdk//src/rp2_common/pico_stdlib",
         "@shizuku//:internal_headers",
         "@shizuku//configs:config",
         "@shizuku//modules/pico_sdk_support:headers",
+        "@shizuku//modules/pico_sdk_support/objects:ble_uart", # bt_classic.hpp / ble_uart.hpp
     ],
 )
 
 cc_binary(
     name = "car.elf",
     srcs = ["main.cpp"],
+    # 像が本体区画 (1 MiB) を越えたらリンクで落とす (OTA がステージング/FS に食い込まない保険)。
+    additional_linker_inputs = ["rp2350_flash_limit.ld"],
+    linkopts = ["-Wl,-T,$(location :rp2350_flash_limit.ld)"],
     deps = [
         ":car_objects",
+        "@xno//objects/ota:ota",       # BLE OTA 本体 (alwayslink)
+        "@shizuku//modules/pico_sdk_support/objects:xno_ota_media", # OTA の媒体境界 (RP2350 実装)
         "@pico-sdk//src/rp2_common/pico_stdlib",
         "@shizuku//:internal_headers",
         "@shizuku//:kernel_object",
         "@shizuku//configs:config",
         "@shizuku//modules/pico_sdk_support",
+        "@shizuku//modules/pico_sdk_support/objects:ble_uart", # BT core (CYW43 owner)
+        "@shizuku//modules/pico_sdk_support/objects:usb_cdc",
+        "@pico-sdk//src/rp2_common/pico_multicore",
     ],
 )
 
@@ -54,4 +62,11 @@ genrule(
         ":host_picotool": [],
         "//conditions:default": ["@picotool//:picotool"],
     }),
+)
+
+# OTA で送る生バイナリ (tools/ble_ota_send.py send に渡すのはこれ。UF2 ではない)。
+objcopy_to_bin(
+    name = "car_bin",
+    src = ":car.elf",
+    out = "car.bin",
 )

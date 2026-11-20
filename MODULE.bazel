@@ -5,12 +5,28 @@ bazel_dep(name = "bazel_skylib", version = "1.6.1")
 bazel_dep(name = "rules_cc", version = "0.0.10")
 bazel_dep(name = "pico-sdk", version = "2.2.0")
 bazel_dep(name = "shizuku", version = "0.1.0")
+bazel_dep(name = "xno", version = "0.1.0") # BLE OTA 本体 (objects/ota)
 
+# clone しただけでビルドできるよう、依存は remote + commit 固定にする。
+# Shizuku は BT core (Classic HID host + BLE NUS + 登録し直し) を載せた
+# exp/bt-core-classic-20261120 のコミット。
 git_override(
     module_name = "shizuku",
     remote = "https://github.com/danfunc/Shizuku.git",
-    commit = "33695581e32fd301a48fe19aa5c5ab8f493afdf9",
+    commit = "019b468a067c8177daef786cb769354df6c059d0",
 )
+
+# BLE OTA (xno::ota)。origin/main の auth_gate / ota_lifecycle / protocol 込みの版。
+git_override(
+    module_name = "xno",
+    remote = "https://github.com/danfunc/XNO.git",
+    commit = "16772bf714af125a4cb9b92ccea859f5374ee9d6",
+)
+
+# 手元で Shizuku / XNO を直しながら開発するときは、gitignore 済みの .bazelrc.user に
+#   common --override_module=shizuku=../Shizuku
+#   common --override_module=xno=/path/to/XNO
+# を書く (git_override より優先される)。
 
 register_toolchains(
     "@pico-sdk//bazel/toolchain:mac-aarch64-rp2350",
