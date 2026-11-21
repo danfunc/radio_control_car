@@ -5,7 +5,7 @@ Bluetoothコントローラーの登録方法はCMakeLists.txtを参照してく
 
 新しいファームで動かなくなったとき、デバッグできなくなったときは、まずこれを書き戻せば走れる状態に戻ります。
 
-- ファイル: `prebuilt/car_fallback_9fc34f7.uf2` (このリポジトリの 9fc34f7 を Pico 2 W 向けにビルドしたもの。2026-11-20 に車へ書き込み、走行を確認した版)
+- ファイル: `prebuilt/car_fallback_9fc34f7.uf2` (このリポジトリの 9fc34f7 を Pico 2 W 向けにビルドしたもの。2026-11-20 に車へ書き込んだ版。2026 年 3 月時点で遊べていた仕様)
 - 確認: `shasum -a 256 -c prebuilt/car_fallback_9fc34f7.uf2.sha256`
 - 書き方:
   1. `git pull` で最新を取る。
