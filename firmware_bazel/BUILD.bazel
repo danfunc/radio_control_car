@@ -1,5 +1,6 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@pico-sdk//bazel/toolchain:objcopy.bzl", "objcopy_to_bin")
+load("@xno//objects/stage3/device:link.bzl", "transitioned_elf")
 
 cc_library(
     name = "car_objects",
@@ -69,4 +70,75 @@ objcopy_to_bin(
     name = "car_bin",
     src = ":car.elf",
     out = "car.bin",
+)
+
+# ---------------------------------------------------------------------------
+# stage3 (常駐ブートローダ + journal) 構成。★opt-in・実機未検証。
+#   bazelisk build --config=stage3 //firmware_bazel:car_full_uf2 //firmware_bazel:car_app_bin
+# 上の car.elf / car_uf2 / car_bin には一切触れない (従来どおり 0x10000000 起点の 1 枚像)。
+# ここの car_app.elf は同じ依存を app 用リンカスクリプト (0x1000A000 起点、984 KiB) で
+# リンクし直したもの。flash 上限は app_rp2350.ld の ASSERT が持つので rp2350_flash_limit.ld は付けない。
+# ---------------------------------------------------------------------------
+
+cc_binary(
+    name = "_car_app_raw.elf",
+    srcs = ["main.cpp"],
+    tags = ["manual"],
+    deps = [
+        ":car_objects",
+        "@xno//objects/ota:ota",
+        "@shizuku//modules/pico_sdk_support/objects:xno_ota_media",
+        "@pico-sdk//src/rp2_common/pico_stdlib",
+        "@shizuku//:internal_headers",
+        "@shizuku//:kernel_object",
+        "@shizuku//configs:config",
+        "@shizuku//modules/pico_sdk_support",
+        "@shizuku//modules/pico_sdk_support/objects:ble_uart",
+        "@shizuku//modules/pico_sdk_support/objects:usb_cdc",
+        "@pico-sdk//src/rp2_common/pico_multicore",
+    ],
+)
+
+transitioned_elf(
+    name = "car_app.elf",
+    binary = ":_car_app_raw.elf",
+    copy_to_ram = False,
+    linker_script = "@xno//objects/stage3/device:app_linker_script",
+    tags = ["manual"],
+)
+
+# OTA で送る stage3 構成用の生バイナリ (0x1000A000 起点)。
+objcopy_to_bin(
+    name = "car_app_bin",
+    src = ":car_app.elf",
+    out = "car_app.bin",
+    tags = ["manual"],
+)
+
+# 初回 USB 書込み用 UF2 (RP2350 Arm Secure family 0xE48BFF59)。
+# prefix(stage3) + journal(DONE gen 1) + app だけを書く。FS / staging / BT には触れない。
+genrule(
+    name = "car_full_uf2",
+    srcs = [
+        "@xno//objects/stage3/device:stage3_bin",
+        ":car_app_bin",
+    ],
+    outs = ["car_full.uf2"],
+    cmd = "$(location @xno//tools/stage3:provision_rp2350) --stage3 $(location @xno//objects/stage3/device:stage3_bin) --app $(location :car_app_bin) --uf2 $@",
+    tags = ["manual"],
+    tools = ["@xno//tools/stage3:provision_rp2350"],
+)
+
+# 成果物の形の検査 (reset vector が 0x1000A000 内、UF2 の family と書込み範囲)。
+genrule(
+    name = "car_full_uf2_check",
+    srcs = [
+        "@xno//objects/stage3/device:stage3_bin",
+        ":car_app_bin",
+        ":car_full_uf2",
+    ],
+    outs = ["car_full_uf2_check.txt"],
+    cmd = "python3 $(location check_stage3_images.py) --stage3 $(location @xno//objects/stage3/device:stage3_bin) --app $(location :car_app_bin) --uf2 $(location :car_full_uf2) > $@",
+    tags = ["manual"],
+    tools = ["check_stage3_images.py"],
 )

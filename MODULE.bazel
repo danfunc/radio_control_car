@@ -16,11 +16,12 @@ git_override(
     commit = "205edd7b4b3403d5033a1003c73aa49d3fbd97fd",
 )
 
-# BLE OTA (xno::ota)。origin/main の auth_gate / ota_lifecycle / protocol 込みの版。
+# BLE OTA (xno::ota) と stage3 (常駐ブートローダ + journal)。
+# feat/stage3-journal-20261121 (origin/main 16772bf から分岐)。stage3 は --config=stage3 のときだけ使う。
 git_override(
     module_name = "xno",
     remote = "https://github.com/danfunc/XNO.git",
-    commit = "16772bf714af125a4cb9b92ccea859f5374ee9d6",
+    commit = "2940bd016482905575814bf92cce5269a9a09c60",
 )
 
 # 手元で Shizuku / XNO を直しながら開発するときは、gitignore 済みの .bazelrc.user に

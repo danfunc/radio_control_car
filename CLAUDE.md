@@ -68,6 +68,23 @@ bazelisk build --config=rp2350_pico2_w //firmware_bazel:car_bin   # OTA 用の�
 3. **電源投入時に BOOTSEL を押しっぱなしにしない** (USB ブートローダになる)。
    登録し直しの長押しは起動後にだけ使う。
 
+### 4a. stage3 構成 (常駐ブートローダ + journal): opt-in・**実機未検証**
+
+通常の `car_uf2` / `car_bin` (上の 3・4 節) は stage3 を使わない。stage3 を試すときだけ次を使う。
+
+```
+bazelisk build --config=stage3 //firmware_bazel:car_full_uf2 //firmware_bazel:car_app_bin //firmware_bazel:car_full_uf2_check
+```
+
+- 初回だけ `bazel-bin/firmware_bazel/car_full.uf2` (stage3 + journal + app。family 0xE48BFF59) を
+  BOOTSEL で USB 書込み。FS / staging / BT の領域には触れない。
+- 以後の OTA は **`car_app.bin`** (0x1000A000 起点の app。`car.bin` ではない) を送る。
+- OTA の commit で電断しても、次の起動で stage3 が journal を見て自動で再試行する。
+  3 回失敗すると BOOTSEL (USB ブートローダ) へ落ちる、という設計。
+- `car_full_uf2_check` は reset vector が 0x1000A000 内か、UF2 の family と書込み範囲が
+  prefix / journal / app だけかを機械検査する (形の検査。実機動作の証拠ではない)。
+- ビルドが通ることまでは確認済み。stage3 の起動・commit・再試行・3 回で BOOTSEL は **未検証**。
+
 ## 5. コントローラ (Switch Pro 互換機) のペアリングと登録し直し
 
 - 起動時、保存済みの相手 (bond) があればその相手へ、無ければ既定アドレス `REMOTE_BD_ADDR`

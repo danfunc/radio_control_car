@@ -29,3 +29,8 @@ build:macos --define=picotool=host
 try-import %workspace%/.bazelrc.user
 # BOOTSEL 長押しでコントローラ登録し直し (gpio BOOTSEL_READ_PRESSED を有効にする)
 build:rp2350_pico2_w --@shizuku//configs:bootsel_support=enabled
+
+# opt-in (実機未検証): 常駐ブートローダ stage3 + journal 入りの構成。
+#   bazelisk build --config=stage3 //firmware_bazel:car_full_uf2 //firmware_bazel:car_app_bin
+# --config=stage3 を付けない既存の car_uf2 / car_bin は変わらない (app は別ターゲットで 0x1000A000 にリンク)。
+build:stage3 --config=rp2350_pico2_w

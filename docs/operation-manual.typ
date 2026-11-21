@@ -149,6 +149,21 @@ bazelisk build --config=rp2350_pico2_w //firmware_bazel:car_uf2
 
 + 電源投入時に BOOTSEL を押しっぱなしにしない (書き込み時の USB 挿しは除く)。
 
+== (B) 電断に強い構成 (stage3) を書く #unverified
+
+*任意の試験的な構成です。実機で一度も動かしていません。* 普段は上の手順で十分です。
+
+```
+bazelisk build --config=stage3 //firmware_bazel:car_full_uf2 //firmware_bazel:car_app_bin
+# できるもの: bazel-bin/firmware_bazel/car_full.uf2 (初回の USB 書込み用)
+#            bazel-bin/firmware_bazel/car_app.bin  (以後の OTA 用)
+```
+
++ 初回だけ、BOOTSEL を押したまま USB を挿して `car_full.uf2` を書く (`picotool load -v -x bazel-bin/firmware_bazel/car_full.uf2`)。
++ 以後の OTA で送るのは *`car_app.bin`* です (`car.bin` ではありません)。
++ OTA の最中に電源が落ちても、次の起動で自動的にやり直す設計です。3 回続けて失敗すると BOOTSEL (USB ブートローダ) になるので、USB で書き直してください。
++ この構成と上の通常の構成を混ぜて OTA しない。どちらの構成で書いたかを控えておく。
+
 == (A) 予備ファームを書き戻す
 
 `rc-main` (main ブランチ) のクローンで行います。
