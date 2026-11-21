@@ -299,10 +299,15 @@ void ble_pair_poll() {
   const auto r = call(shizuku::object_id::ble_uart,
       (uintptr_t)shizuku::objects::ble_uart::method::GET_PAIRING_STATE, (uintptr_t)&st);
   if (r.error != 0 || r.value == 0) return;
-  if (st.nc_pending != 0) {
-    if (!pair_pending || st.nc_generation != pair_pending_gen) {
-      std::printf("[CAR] BLE pairing request (num=%06lu): press BOOTSEL to approve\n",
-                  (unsigned long)st.nc_passkey);
+  if (st.approval_pending != 0) {
+    const bool has_num = st.approval_has_number != 0;
+    // NC は通し番号で新規要求を判定。JW は番号が無いので立ち上がりだけで 1 回表示する。
+    if (!pair_pending || (has_num && st.nc_generation != pair_pending_gen)) {
+      if (has_num)
+        std::printf("[CAR] BLE pairing request (num=%06lu): press BOOTSEL to approve\n",
+                    (unsigned long)st.nc_passkey);
+      else
+        std::printf("[CAR] BLE pairing request (no number): press BOOTSEL to approve\n");
       pair_pending_gen = st.nc_generation;
     }
     pair_pending = true;
