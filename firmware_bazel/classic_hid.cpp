@@ -198,12 +198,13 @@ void on_report(const uint8_t *report, uint16_t len) {
   }
 }
 
-// ---- コントローラの登録し直し (BOOTSEL 3 秒長押し) --------------------------------
+// ---- BOOTSEL による登録し直し / BLE 一回券 --------------------------------
 // ★実機未検証の仮実装。IF (bc::TX_FORGET / TX_SCAN_* / TX_LIST_BONDS と RX_SCAN_* / RX_BOND*)
 //   は DESIGN.md「コントローラの登録し直し」に合わせてある。
 // 状態遷移:
 //   STARTUP --RX_BOND_END (か 15 秒待ち切れ)--> NORMAL : bond があればその相手へ、なければ既定へ TX_CONNECT
-//   NORMAL  --BOOTSEL 3 秒--> SCAN : モーター停止、TX_FORGET(全) → TX_SCAN_START(30 秒)
+//   NORMAL  --BOOTSEL 3〜10 秒で離す--> SCAN : モーター停止、TX_FORGET(全) → TX_SCAN_START(30 秒)
+//   NORMAL  --BOOTSEL 10 秒--> NORMAL : BLE の期限付き一回券を発行、離しても SCAN しない
 //   SCAN    --RX_SCAN_FOUND (ゲームパッド CoD)--> PAIRING : TX_CONNECT(その相手)
 //   SCAN    --RX_SCAN_DONE (見つからず)/ 40 秒超過--> NORMAL : 既定アドレスへ TX_CONNECT
 //   PAIRING --RX_SCAN_DONE(1) / RX_OPENED--> NORMAL (接続はカーネルが続ける)
@@ -212,6 +213,7 @@ enum RegMode { REG_STARTUP, REG_NORMAL, REG_SCAN, REG_PAIRING };
 RegMode reg_mode = REG_STARTUP;
 constexpr uint64_t kBootselPollUs = 100000;
 constexpr uint64_t kBootselHoldUs = 3000000;
+constexpr uint64_t kBootselBleUs = 10000000;
 constexpr uint8_t kScanSeconds = 30;
 constexpr uint64_t kScanGuardUs = (uint64_t)(kScanSeconds + 10) * 1000000ull;
 constexpr uint64_t kBondQueryTimeoutUs = 15000000;
@@ -220,9 +222,20 @@ uint64_t reg_stage_us = 0;     // STARTUP / SCAN に入った時刻
 uint64_t bootsel_poll_us = 0;
 uint64_t bootsel_down_us = 0;  // 押し始めた時刻 (0 = 押していない)
 bool bootsel_fired = false;    // 長押し成立済み (離すまで再発火しない)
+bool bootsel_indicated = false;
 bool bootsel_available = true; // gpio object が無い等で読めなければ以後読まない
 uint64_t blink_us = 0;
 bool blink_on = false;
+// BLE 一回券の残り監視 / 承認待ち表示 (承認そのものはカーネルが BOOTSEL でやる)。
+constexpr uint64_t kPairPollUs = 200000;
+constexpr uint64_t kPairBlinkUs = 300000;
+constexpr uint64_t kPairTicketUs = 180000000;
+uint64_t pair_ticket_until_us = 0; // 0 = 一回券なし (発行から 3 分の目安)
+uint64_t pair_poll_us = 0;
+uint64_t pair_blink_us = 0;
+bool pair_pending = false;         // カーネルが BOOTSEL 承認待ち (nc_pending=1)
+bool pair_blink_on = false;
+uint32_t pair_pending_gen = 0;
 uint8_t bond_count = 0;
 uint8_t first_bond[6] = {};
 bool bond_is_default = false;
@@ -268,10 +281,53 @@ bool read_bootsel(bool &pressed) {
   return true;
 }
 
-// BOOTSEL を約 100 ms 周期で読み、3 秒の長押しで 1 回だけ登録し直しへ入る。
+// 一回券がある間だけ GET_PAIRING_STATE を 200 ms ごとに読み、承認待ちなら紫点滅。
+// ★車は PAIRING_ANSWER を呼ばない。承認はカーネルが BOOTSEL の押して離すで行う。
+// ★紫 (255,0,255) は琥珀 (登録探索) / 青 (一回券) と区別するための色。
+void ble_pair_poll() {
+  const uint64_t t = now_us();
+  if (pair_ticket_until_us == 0 && !pair_pending) return;
+  if (pair_pending && t - pair_blink_us >= kPairBlinkUs) {
+    pair_blink_us = t;
+    pair_blink_on = !pair_blink_on;
+    call(id::io, (uintptr_t)io_method::set_central,
+         pair_blink_on ? urgb_u32(255, 0, 255) : 0);
+  }
+  if (t - pair_poll_us < kPairPollUs) return;
+  pair_poll_us = t;
+  shizuku::objects::ble_uart::pairing_state st{};
+  const auto r = call(shizuku::object_id::ble_uart,
+      (uintptr_t)shizuku::objects::ble_uart::method::GET_PAIRING_STATE, (uintptr_t)&st);
+  if (r.error != 0 || r.value == 0) return;
+  if (st.nc_pending != 0) {
+    if (!pair_pending || st.nc_generation != pair_pending_gen) {
+      std::printf("[CAR] BLE pairing request (num=%06lu): press BOOTSEL to approve\n",
+                  (unsigned long)st.nc_passkey);
+      pair_pending_gen = st.nc_generation;
+    }
+    pair_pending = true;
+    return;
+  }
+  if (pair_pending) { // 承認・拒否・時間切れのどれかで終わった
+    pair_pending = false;
+    pair_blink_on = false;
+    call(id::io, (uintptr_t)io_method::set_central, hid_open ? urgb_u32(0, 0, 255) : 0);
+  }
+  if (st.allow_seconds_left == 0 && t >= pair_ticket_until_us)
+    pair_ticket_until_us = 0; // 一回券を使った / 期限切れ
+}
+
+// 3 秒で琥珀、離せば登録し直し。10 秒で BLE 一回券を発行し青点滅。
 void bootsel_poll() {
   if (!bootsel_available || reg_mode != REG_NORMAL) return;
   const uint64_t t = now_us();
+  // BLE 承認待ちの間は BOOTSEL をカーネルの承認に譲る (3 秒 / 10 秒処理を動かさない)。
+  if (pair_pending) {
+    bootsel_down_us = 0;
+    bootsel_fired = false;
+    bootsel_indicated = false;
+    return;
+  }
   if (t - bootsel_poll_us < kBootselPollUs) return;
   bootsel_poll_us = t;
   bool pressed = false;
@@ -281,14 +337,35 @@ void bootsel_poll() {
     return;
   }
   if (!pressed) {
+    const bool reregister = bootsel_down_us != 0 && bootsel_indicated && !bootsel_fired;
+    if (bootsel_indicated || bootsel_fired)
+      call(id::io, (uintptr_t)io_method::set_central, hid_open ? urgb_u32(0, 0, 255) : 0);
     bootsel_down_us = 0;
     bootsel_fired = false;
+    bootsel_indicated = false;
+    if (reregister) start_reregister();
     return;
   }
   if (bootsel_down_us == 0) bootsel_down_us = t;
-  if (!bootsel_fired && t - bootsel_down_us >= kBootselHoldUs) {
+  const uint64_t held = t - bootsel_down_us;
+  if (!bootsel_fired && held >= kBootselBleUs) {
     bootsel_fired = true;
-    start_reregister();
+    const auto result = call(shizuku::object_id::ble_uart,
+        (uintptr_t)shizuku::objects::ble_uart::method::SET_PAIRING_LOCK, 0);
+    if (result.error == 0 && result.value != 0)
+    {
+      std::printf("[CAR] BOOTSEL 10s: BLE pairing allow ticket (3 minutes)\n");
+      pair_ticket_until_us = t + kPairTicketUs;
+    }
+    else
+      std::printf("[CAR] BOOTSEL 10s: BLE pairing allow failed\n");
+  }
+  if (bootsel_fired) {
+    call(id::io, (uintptr_t)io_method::set_central,
+         ((held - kBootselBleUs) / kScanBlinkUs) % 2 == 0 ? urgb_u32(0, 0, 255) : 0);
+  } else if (!bootsel_indicated && held >= kBootselHoldUs) {
+    bootsel_indicated = true;
+    call(id::io, (uintptr_t)io_method::set_central, urgb_u32(255, 160, 0));
   }
 }
 
@@ -424,6 +501,7 @@ uintptr_t hid_poll(uintptr_t, uintptr_t, uintptr_t, uintptr_t) {
     while (g_rx.available() != 0 && g_rx.pop(&f)) on_frame(f);
     init_poll();
     bootsel_poll();
+    ble_pair_poll();
     reg_poll();
     // 0x3F は変化があったときしか来ないので、毎周期流れる 0x30 に入った後だけ
     // 無通信を異常とみなす。

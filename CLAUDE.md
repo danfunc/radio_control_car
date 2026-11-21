@@ -8,7 +8,7 @@
 次は **コードは書いてありビルドも通したが、実機で一度も動かしていない**。
 動作を断定する文を書かない。「実機で確認が要る」と書き、結果はログで示す。
 
-- BOOTSEL 3 秒長押しによるコントローラ登録し直し (`firmware_bazel/classic_hid.cpp`、カーネル側 `bt_classic.cpp`)
+- BOOTSEL 3〜10 秒で離すとコントローラ登録し直し、10 秒で BLE 一回券 (`firmware_bazel/classic_hid.cpp`、実機未検証)
 - 起動時の bond 列挙 (`TX_LIST_BONDS`) からの接続先決定
 - この車への BLE OTA の組み込み (`firmware_bazel/main.cpp`、`@xno//objects/ota:ota`)
 
@@ -72,7 +72,8 @@ bazelisk build --config=rp2350_pico2_w //firmware_bazel:car_bin   # OTA 用の�
 
 - 起動時、保存済みの相手 (bond) があればその相手へ、無ければ既定アドレス `REMOTE_BD_ADDR`
   (`classic_hid.cpp:20` 付近、98:B6:B4:74:B1:55) へ接続する。
-- **登録し直し**: 起動後に BOOTSEL を **3 秒長押し** → 保存済み鍵を全消去し、30 秒間コントローラを探す。
+- **BLE 解錠・承認**: BOOTSEL 10 秒 → 青点滅 (3 分の一回券) → PC からペアリング → 紫点滅 → BOOTSEL を短く押して離す (Shizuku ble_uart が読む。車は PAIRING_ANSWER を呼ばない)。USB 接続時は番号照合可、無接続時は番号確認なし (#unverified)。
+- **登録し直し**: 起動後に BOOTSEL を押し、3 秒で琥珀点灯したら 10 秒になる前に離す → 保存済み鍵を全消去し、30 秒間コントローラを探す。
   - コントローラ側のシンクボタン (ペアリング待ち) は **別に自分で押す**。BOOTSEL では代替できない。
   - 最初に見つかったゲームパッドの CoD (major 0x05、minor 1/2) の相手へ接続する。
   - LED (中央 4 灯): 琥珀の点滅 = 探索中 / 白 = 接続中 / 青 = HID 接続済み。見つからなければ既定アドレスへ戻る。
@@ -120,10 +121,11 @@ python3 <Shizuku>/tools/ble_ota_send.py send bazel-bin/firmware_bazel/car.bin --
 - **commit 中 (flash を書き換えている最中) に電源が落ちた / 起動しない**: A/B 面は無い
   (`Shizuku/docs/design/rp-ota-commit-retry.typ`)。**USB で書き直す** (§4)。これが正規の復旧。
 - **BLE から入れなくなった (施錠)** — 調べた結果:
+  - 起動後 BOOTSEL を 10 秒押し続けると BLE の 3 分間有効な一回券を発行する (青点滅、実機未検証)。離してもコントローラ登録し直しはしない。BLE ボンドの消去はしない。
   - USB CDC (有線) の解錠コマンド (`ble_uart.cpp` の `handle_cdc_command_line`、実機未検証):
     `PAIR ALLOW` + 改行 = 3 分間有効な新規ペアリングの一回券、`PAIR FORGET!` + 改行 = BLE ボンド全消去。
     ログ `[BLE_UART] CDC pairing allow ticket issued (3 minutes)` / `[BLE_UART] CDC forget bonds requested`。
-    有線でしか解錠できない、という施錠の方針どおり。`PAIR FORGET!` は人間が指示したときだけ打つ。
+    `PAIR FORGET!` は人間が指示したときだけ打つ。
   - それでも戻らなければ `picotool erase -a` で flash を全消去 → §4 で書き直し (実機未検証)。
     bonding バンクだけ消す方法はアドレス未確認なので打たない。
   - 予防: PC 側 (macOS の「このデバイスを削除」など) で車のボンドを消さない。消すと施錠で入れなくなる。
