@@ -13,7 +13,7 @@ bazel_dep(name = "xno", version = "0.1.0") # BLE OTA 本体 (objects/ota)
 git_override(
     module_name = "shizuku",
     remote = "https://github.com/danfunc/Shizuku.git",
-    commit = "019b468a067c8177daef786cb769354df6c059d0",
+    commit = "640a5f49197a4a4ede2cdb12e15cb8b6444ecc68",
 )
 
 # BLE OTA (xno::ota)。origin/main の auth_gate / ota_lifecycle / protocol 込みの版。

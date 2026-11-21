@@ -3,6 +3,7 @@
 > **注意: 実機未検証の機能があります。** BOOTSEL 長押しによるコントローラの登録し直しと、車への BLE OTA の
 > 組み込みは、ビルドまで確認したものの実機では動かしていません。動かして確かめた結果は
 > ログで示してください。AI エージェントを使う場合は `CLAUDE.md` を読ませてください。
+> 印刷用の運用マニュアル (Typst): [docs/operation-manual.typ](docs/operation-manual.typ)
 
 ## ビルドと書込み (Pico 2 W)
 

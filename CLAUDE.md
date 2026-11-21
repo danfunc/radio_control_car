@@ -14,6 +14,9 @@
 
 実機で確かめ済みの前提は無いものとして扱う。確かめたら、この節の該当行を更新する。
 
+- OTA 中の電池抜きは USB 復旧で受容する (ユーザー決定)。
+- 予備ファームは `main` ブランチの `prebuilt/` (`car_fallback_9fc34f7.uf2`)。人間向け手順は `docs/operation-manual.typ`。
+
 ## 1. 構成
 
 ```
@@ -117,15 +120,12 @@ python3 <Shizuku>/tools/ble_ota_send.py send bazel-bin/firmware_bazel/car.bin --
 - **commit 中 (flash を書き換えている最中) に電源が落ちた / 起動しない**: A/B 面は無い
   (`Shizuku/docs/design/rp-ota-commit-retry.typ`)。**USB で書き直す** (§4)。これが正規の復旧。
 - **BLE から入れなくなった (施錠)** — 調べた結果:
-  - 解錠は `SET_PAIRING_LOCK` (method 11) と `FORGET_BONDS` (method 12) を呼ぶことでしかできない
-    (`ble_uart.hpp` の `method` 参照)。コメントにある「有線の `nc allow` / `nc forget!`」は **Shizuku の
-    シェル (XIAO 構成) の機能** で、**この車には無い** (車のコードは 11 / 12 を呼ばない。CDC で受け付けるのは
-    `A` `S` `R` `Y` `N` だけ: `ble_uart.cpp:401-440`)。つまり車単体では BLE の施錠を CDC から外せない。
-  - 復旧の候補 (どれも実機未検証): ① `picotool erase -a` で flash を全消去 → §4 で書き直し。ボンドも
-    Classic の鍵も消えるので一番確実。② bonding バンクだけ消す (範囲は `flash_map.hpp` の
-    `BT_RESERVED_OFFSET` から。Pico 2 W 4 MiB なら末尾から 3 番目の 2 セクタのはずだが、**数値は未確認**なので
-    アドレスを断定して打たない)。③ 将来、車に CDC コマンド (`FORGET_BONDS` を呼ぶ) を足す案。
-    これは施錠の趣旨を変える設計判断なので、人間の了承なしにやらない。
+  - USB CDC (有線) の解錠コマンド (`ble_uart.cpp` の `handle_cdc_command_line`、実機未検証):
+    `PAIR ALLOW` + 改行 = 3 分間有効な新規ペアリングの一回券、`PAIR FORGET!` + 改行 = BLE ボンド全消去。
+    ログ `[BLE_UART] CDC pairing allow ticket issued (3 minutes)` / `[BLE_UART] CDC forget bonds requested`。
+    有線でしか解錠できない、という施錠の方針どおり。`PAIR FORGET!` は人間が指示したときだけ打つ。
+  - それでも戻らなければ `picotool erase -a` で flash を全消去 → §4 で書き直し (実機未検証)。
+    bonding バンクだけ消す方法はアドレス未確認なので打たない。
   - 予防: PC 側 (macOS の「このデバイスを削除」など) で車のボンドを消さない。消すと施錠で入れなくなる。
 
 ## 7. 触ってはいけない所
